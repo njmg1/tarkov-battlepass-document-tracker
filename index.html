@@ -74,8 +74,10 @@ tr:last-child td{border-bottom:0}
     <div class="subtitle">시즌 문서 수집 현황을 기록합니다. 진행 상황은 이 브라우저에 자동 저장됩니다.</div>
   </div>
   <div class="actions">
-    <button onclick="exportData()">저장 데이터 내보내기</button>
+    <button onclick="exportData()">백업 내보내기</button>
+    <button onclick="triggerImport()">백업 불러오기</button>
     <button class="reset" onclick="resetData()">전체 초기화</button>
+    <input id="importFile" type="file" accept="application/json,.json" hidden onchange="importData(this)">
   </div>
 </header>
 
@@ -276,13 +278,94 @@ function runTimer(){
   timerInterval=setInterval(updateTimer,1000);
 }
 
+const BACKUP_VERSION=2;
+
 function exportData(){
-  const blob=new Blob([JSON.stringify(acquired,null,2)],{type:"application/json"});
+  const payload={
+    format:"tarkov-document-tracker",
+    version:BACKUP_VERSION,
+    exportedAt:new Date().toISOString(),
+    documents:DATA.map(d=>d[0]),
+    needed:DATA.map((d,i)=>Number(needed[i])||0),
+    acquired:DATA.map((d,i)=>Number(acquired[i])||0),
+    resetTimerEnd:Number(resetTimerEnd)||0
+  };
+  const stamp=new Date();
+  const pad=v=>String(v).padStart(2,"0");
+  const name=`tarkov-document-backup-${stamp.getFullYear()}${pad(stamp.getMonth()+1)}${pad(stamp.getDate())}-${pad(stamp.getHours())}${pad(stamp.getMinutes())}.json`;
+  const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
   const a=document.createElement("a");
   a.href=URL.createObjectURL(blob);
-  a.download="tarkov-document-progress.json";
+  a.download=name;
   a.click();
   URL.revokeObjectURL(a.href);
+}
+
+function triggerImport(){
+  const input=document.getElementById("importFile");
+  if(input) input.click();
+}
+
+function toCount(value){
+  const n=Math.floor(Number(value));
+  return (Number.isFinite(n) && n>0) ? n : 0;
+}
+
+function parseBackup(raw){
+  let obj;
+  try{ obj=JSON.parse(raw); }
+  catch(e){ return {error:"JSON 형식이 아닙니다. 내보내기로 받은 파일이 맞는지 확인해주세요."}; }
+  if(!obj || typeof obj!=="object" || Array.isArray(obj)) return {error:"백업 파일 내용을 읽을 수 없습니다."};
+
+  // 구버전 백업: 획득 수량만 담긴 객체 {"0":3,"1":1,...}
+  const isLegacy = !("needed" in obj) && !("acquired" in obj);
+  const src = isLegacy ? obj : obj.acquired;
+  if(src===undefined || src===null) return {error:"백업 파일에 획득 수량이 없습니다."};
+
+  const nextNeeded=DATA.map((d,i)=>{
+    if(isLegacy) return Number(needed[i])||0;   // 구버전엔 필요 수량이 없으니 현재 값 유지
+    return toCount(Array.isArray(obj.needed) ? obj.needed[i] : (obj.needed||{})[i]);
+  });
+  const nextAcquired=DATA.map((d,i)=>{
+    const v=toCount(Array.isArray(src) ? src[i] : src[i]);
+    return Math.min(v,nextNeeded[i]);
+  });
+
+  let nextTimer=Number(obj.resetTimerEnd);
+  if(!Number.isFinite(nextTimer) || nextTimer<0) nextTimer=0;
+
+  return {legacy:isLegacy, needed:nextNeeded, acquired:nextAcquired, resetTimerEnd:nextTimer};
+}
+
+function applyBackup(data){
+  needed=data.needed;
+  acquired={};
+  data.acquired.forEach((v,i)=>{ acquired[i]=v; });
+  resetTimerEnd=data.resetTimerEnd;
+  saveNeeded();
+  save();
+  if(resetTimerEnd) localStorage.setItem(TIMER_KEY,String(resetTimerEnd));
+  else localStorage.removeItem(TIMER_KEY);
+  render();
+  runTimer();
+}
+
+function importData(input){
+  const file=input && input.files && input.files[0];
+  if(!file){ return; }
+  const reader=new FileReader();
+  reader.onload=()=>{
+    const parsed=parseBackup(String(reader.result));
+    input.value="";                       // 같은 파일 다시 선택 가능하게
+    if(parsed.error){ alert(parsed.error); return; }
+    const total=parsed.acquired.reduce((a,b)=>a+b,0);
+    const goal=parsed.needed.reduce((a,b)=>a+b,0);
+    const extra=parsed.legacy ? "\n(구버전 백업이라 필요 수량과 타이머는 지금 값을 유지합니다.)" : "";
+    if(!confirm(`백업을 불러오면 현재 기록을 덮어씁니다.\n불러올 내용: ${total} / ${goal}${extra}\n계속할까요?`)) return;
+    applyBackup(parsed);
+  };
+  reader.onerror=()=>{ input.value=""; alert("파일을 읽지 못했습니다."); };
+  reader.readAsText(file);
 }
 render();
 runTimer();
